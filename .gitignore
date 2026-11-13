@@ -1,0 +1,12 @@
+# Aqui solo vive el cascaron de la presentacion. Se ignora todo salvo lo listado,
+# asi un Excel de datos que caiga en esta carpeta nunca llega al repositorio.
+*
+!.gitignore
+!.nojekyll
+!index.html
+!fotos.js
+!README.md
+!publicar.bat
+!lib/
+!lib/pptxgen.bundle.js
+!lib/pptxgenjs-LICENSE.txt

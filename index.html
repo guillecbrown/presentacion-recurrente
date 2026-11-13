@@ -1,0 +1,813 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Presentación recurrente</title>
+<style>
+  :root { --tinta: #18181b; --gris: #71717a; --linea: #e4e4e7; --fondo: #f4f4f5; --acento: #1d4ed8; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px "Segoe UI", Arial, sans-serif; color: var(--tinta); background: var(--fondo); }
+  #barra { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 10px; padding: 10px 18px;
+           background: #fff; border-bottom: 1px solid var(--linea); }
+  #barra strong { font-size: 15px; margin-right: 6px; }
+  #barra .hueco { flex: 1; }
+  #estado { color: var(--gris); }
+  button { font: inherit; padding: 7px 14px; border: 1px solid var(--linea); border-radius: 7px; background: #fff; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: #a1a1aa; }
+  button:disabled { color: #a1a1aa; cursor: default; }
+  button.principal { background: var(--acento); border-color: var(--acento); color: #fff; }
+  #avisos { max-width: 1280px; margin: 14px auto 0; padding: 0 18px; }
+  #avisos ul { margin: 0; padding: 10px 14px 10px 30px; background: #fff7ed; border: 1px solid #fdba74; border-radius: 8px; }
+  #avisos li { margin: 3px 0; }
+  #laminas { max-width: 1280px; margin: 0 auto; padding: 14px 18px 40px; }
+  .lamina { margin: 0 0 18px; background: #fff; box-shadow: 0 1px 6px rgba(0,0,0,.14); line-height: 0; }
+  .lamina svg { width: 100%; height: auto; display: block; }
+  #vacio { margin-top: 60px; padding: 70px 20px; text-align: center; color: var(--gris); border: 2px dashed #d4d4d8;
+           border-radius: 12px; background: #fff; }
+  body.soltar #vacio, body.soltar .lamina { outline: 3px solid var(--acento); }
+  @page { size: 13.333in 7.5in; margin: 0; }
+  @media print {
+    body { background: #fff; }
+    #barra, #avisos, #vacio { display: none !important; }
+    #laminas { max-width: none; margin: 0; padding: 0; }
+    .lamina { width: 13.333in; height: 7.5in; margin: 0; box-shadow: none; break-after: page; overflow: hidden; }
+    .lamina:last-child { break-after: auto; }
+    .lamina svg { width: 13.333in; height: 7.5in; }
+  }
+</style>
+</head>
+<body>
+<header id="barra">
+  <strong>Presentación recurrente</strong>
+  <button id="btnCargar" class="principal">Cargar datos</button>
+  <input type="file" id="archivo" accept=".xlsx" hidden>
+  <span id="estado">Sin datos cargados.</span>
+  <span class="hueco"></span>
+  <button id="btnPdf" disabled title="Abre el diálogo de impresión; elegir Guardar como PDF">PDF</button>
+  <button id="btnPptx" disabled>PowerPoint</button>
+  <button id="btnPng" disabled>Imágenes PNG</button>
+</header>
+<div id="avisos"></div>
+<main id="laminas">
+  <div id="vacio">Arrastra aquí el Excel de datos o usa <b>Cargar datos</b>.<br>El archivo se lee en este navegador y no se envía a ningún lado.</div>
+</main>
+
+<script src="lib/pptxgen.bundle.js"></script>
+<script src="fotos.js"></script>
+<script>
+"use strict";
+// =====================================================================
+//  Cascaron de la presentacion. No lleva datos ni textos propios: todo
+//  sale del Excel que se carga (pestañas DATOS, RANKING y TEXTOS).
+//  Cada lamina se dibuja en SVG sobre un lienzo de 1920 x 1080; de ese
+//  mismo dibujo salen la pantalla, el PDF, los PNG y el pptx.
+// =====================================================================
+
+const ANCHO = 1920, ALTO = 1080;
+const FUENTE = '"Segoe UI", Arial, sans-serif';
+const $ = (s) => document.querySelector(s);
+
+let D = null;        // datos cargados: { datos, textos, ranking, faltan, nombre }
+let LAMINAS = [];    // laminas dibujadas: { svg, svgFondo, campos }
+
+// ------------------------------------------------------------- lectura del Excel
+// Un .xlsx es un zip de XML. Se lee con el JSZip que ya trae la libreria del pptx.
+async function leerExcel(buffer) {
+  let zip;
+  try { zip = await JSZip.loadAsync(buffer); }
+  catch (e) { throw new Error("no es un Excel (.xlsx). Descarga la hoja de datos como Excel y carga ese archivo."); }
+  const xml = async (ruta) => {
+    const f = zip.file(ruta);
+    return f ? new DOMParser().parseFromString(await f.async("string"), "application/xml") : null;
+  };
+  const libro = await xml("xl/workbook.xml");
+  const rels = await xml("xl/_rels/workbook.xml.rels");
+  if (!libro || !rels) throw new Error("El archivo no es un Excel (.xlsx) válido.");
+
+  const textoDe = (nodo) => [...nodo.getElementsByTagName("t")]
+    .filter((t) => t.parentNode.localName !== "rPh").map((t) => t.textContent).join("");
+  const compartidos = [];
+  const ss = await xml("xl/sharedStrings.xml");
+  if (ss) for (const si of ss.getElementsByTagName("si")) compartidos.push(textoDe(si));
+
+  const destino = {};
+  for (const r of rels.getElementsByTagName("Relationship")) destino[r.getAttribute("Id")] = r.getAttribute("Target");
+  const NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+  const hojas = {};
+  for (const h of libro.getElementsByTagName("sheet")) {
+    const rid = h.getAttributeNS(NS_R, "id") || h.getAttribute("r:id");
+    let ruta = destino[rid] || "";
+    ruta = ruta.startsWith("/") ? ruta.slice(1) : "xl/" + ruta;
+    const doc = await xml(ruta);
+    if (!doc) continue;
+    const filas = [];
+    for (const fila of doc.getElementsByTagName("row")) {
+      const f = [];
+      for (const c of fila.getElementsByTagName("c")) {
+        const letras = (c.getAttribute("r") || "").replace(/\d+/g, "");
+        let col = 0;
+        for (const ch of letras) col = col * 26 + (ch.charCodeAt(0) - 64);
+        const tipo = c.getAttribute("t");
+        const v = c.getElementsByTagName("v")[0];
+        let valor = "";
+        if (tipo === "s") valor = compartidos[+v.textContent] ?? "";
+        else if (tipo === "inlineStr") valor = textoDe(c);
+        else if (tipo === "str") valor = v ? v.textContent : "";
+        else if (tipo === "b") valor = v && v.textContent === "1";
+        else if (v && v.textContent !== "") valor = Number(v.textContent);
+        f[col - 1] = valor;
+      }
+      filas[(+fila.getAttribute("r") || filas.length + 1) - 1] = f;
+    }
+    hojas[h.getAttribute("name")] = filas;
+  }
+  return hojas;
+}
+
+const plano = (s) => String(s ?? "").normalize("NFD").replace(/[̀-ͯ]/g, "").trim().toLowerCase();
+
+function armarModelo(hojas, nombre) {
+  const hd = hojas["DATOS"];
+  if (!hd || !hd[0]) throw new Error("El archivo no tiene la pestaña DATOS.");
+  const enc = hd[0].map(plano);
+  const col = (rotulo) => enc.indexOf(rotulo);
+  const cClave = col("clave"), cValor = col("valor"), cAjuste = col("ajuste manual"), cFuente = col("fuente"),
+        cFecha = col("fecha de la fuente");
+  if (cClave < 0 || cValor < 0) throw new Error("La pestaña DATOS no tiene las columnas CLAVE y VALOR.");
+  const datos = {};
+  hd.slice(1).forEach((f) => {
+    if (!f || f[cClave] === undefined || f[cClave] === "") return;
+    const aj = cAjuste < 0 ? "" : f[cAjuste];
+    const ajustado = aj !== undefined && aj !== "";
+    datos[String(f[cClave]).trim()] = { valor: ajustado ? aj : (f[cValor] ?? ""), ajustado,
+      fuente: cFuente < 0 ? "" : (f[cFuente] ?? ""), fecha: cFecha < 0 ? "" : (f[cFecha] ?? "") };
+  });
+  const textos = {};
+  (hojas["TEXTOS"] || []).slice(1).forEach((f) => { if (f && f[0]) textos[String(f[0]).trim()] = String(f[1] ?? ""); });
+  const ranking = (hojas["RANKING"] || []).slice(1).filter((f) => f && f[0]).map((f) => [String(f[0]), f[1]]);
+  return { datos, textos, ranking, faltan: new Set(), nombre };
+}
+
+// ------------------------------------------------------------- formato de cifras
+const ESP = " ";   // espacio de no separacion, para que una cifra no se parta en dos lineas
+const miles = (n, dec = 0) => {
+  const [e, d] = Math.abs(n).toFixed(dec).split(".");
+  return (n < 0 ? "-" : "") + e.replace(/\B(?=(\d{3})+(?!\d))/g, ESP) + (d ? "." + d : "");
+};
+const pct = (dec) => (v) => (v * 100).toFixed(dec) + "%";
+const FORMATO = {
+  "poi.avance": pct(0),
+  "eje2.adicional.pct": pct(0),
+  "multas.uit": (v) => miles(Math.round(v)),
+  "multas.millones": (v) => (v < 10 ? v.toFixed(1) : String(Math.round(v))),
+};
+function formatear(clave, v) {
+  if (typeof v !== "number") return String(v ?? "");
+  if (FORMATO[clave]) return FORMATO[clave](v);
+  if (/[._]pct$/.test(clave)) return pct(1)(v);
+  return miles(Math.round(v));
+}
+// Dato ya con formato. Lo que falte sale como ¿clave? y queda anotado.
+function dato(clave) {
+  const d = D.datos[clave];
+  if (!d || d.valor === "") { D.faltan.add(clave); return "¿" + clave + "?"; }
+  return formatear(clave, d.valor);
+}
+const numero = (clave) => (D.datos[clave] && typeof D.datos[clave].valor === "number" ? D.datos[clave].valor : 0);
+// Texto de la pestaña TEXTOS con sus {claves} ya reemplazadas.
+function texto(clave) {
+  if (!(clave in D.textos)) { D.faltan.add(clave); return "¿" + clave + "?"; }
+  return D.textos[clave].replace(/\{([^{}]+)\}/g, (_, k) => dato(k.trim()));
+}
+const tieneDato = (clave) => /\{[^{}]+\}/.test(D.textos[clave] || "");
+
+// ------------------------------------------------------------- lienzo SVG
+const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const medidor = document.createElement("canvas").getContext("2d");
+function anchoDe(t, tam, peso) {
+  medidor.font = `${peso} ${tam}px ${FUENTE}`;
+  return medidor.measureText(t).width;
+}
+// "uno **dos** tres" -> tramos [{t, b}]
+const tramos = (s) => { const r = []; let b = false; String(s).split("**").forEach((p) => { if (p) r.push({ t: p, b }); b = !b; }); return r; };
+
+class Lienzo {
+  constructor(n) { this.n = n; this.defs = []; this.fondo = []; this.frente = []; this.campos = []; this.seq = 0; }
+  id(p) { return `${p}${this.n}_${++this.seq}`; }
+  add(s) { this.fondo.push(s); return this; }
+
+  rect(x, y, w, h, o = {}) {
+    return this.add(`<rect x="${x}" y="${y}" width="${w}" height="${h}"${o.r ? ` rx="${o.r}"` : ""} fill="${o.fill || "none"}"` +
+      (o.stroke ? ` stroke="${o.stroke}" stroke-width="${o.sw || 1}"` : "") + (o.op !== undefined ? ` opacity="${o.op}"` : "") + "/>");
+  }
+  linea(x1, y1, x2, y2, color, sw = 2) { return this.add(`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="${sw}"/>`); }
+  circulo(cx, cy, r, o = {}) {
+    return this.add(`<circle cx="${cx}" cy="${cy}" r="${r}" fill="${o.fill || "none"}"` + (o.stroke ? ` stroke="${o.stroke}" stroke-width="${o.sw || 1}"` : "") + "/>");
+  }
+  // Panel con las esquinas redondeadas y, opcional, una pestaña de color a la izquierda, una foto a la
+  // derecha o una cabecera de otro color.
+  panel(x, y, w, h, fill, o = {}) {
+    const clip = this.id("c");
+    this.defs.push(`<clipPath id="${clip}"><rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${o.r ?? 16}"/></clipPath>`);
+    // La foto ya trae fundido su borde izquierdo con su color de fondo: el panel se pinta de ese color.
+    let s = `<g clip-path="url(#${clip})"><rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${o.foto ? o.foto.fondo : fill}"/>`;
+    if (o.foto) {
+      s += `<image href="${o.foto.src}" x="${x + w - o.fotoAncho}" y="${y}" width="${o.fotoAncho}" height="${h}" preserveAspectRatio="xMidYMid slice"/>`;
+    }
+    if (o.pestana) s += `<rect x="${x}" y="${y}" width="${o.pestanaAncho}" height="${h}" fill="${o.pestana}"/>`;
+    if (o.cabecera) s += `<rect x="${x}" y="${y}" width="${w}" height="${o.cabecera.alto}" fill="${o.cabecera.fill}"/>`;
+    return this.add(s + "</g>");
+  }
+  // Anillo de avance. `fraccion` de 0 a 1; por encima de 1 se dibuja completo.
+  anillo(cx, cy, r, grosor, fraccion, color, pista) {
+    const rm = r - grosor / 2, largo = 2 * Math.PI * rm, f = Math.max(0, Math.min(1, fraccion || 0));
+    this.circulo(cx, cy, rm, { stroke: pista, sw: grosor });
+    return this.add(`<circle cx="${cx}" cy="${cy}" r="${rm}" fill="none" stroke="${color}" stroke-width="${grosor}" ` +
+      `stroke-dasharray="${(largo * f).toFixed(2)} ${largo.toFixed(2)}" transform="rotate(-90 ${cx} ${cy})"/>`);
+  }
+  icono(nombre, cx, cy, r, color, trazo = "#fff") {
+    const g = (d, extra = "") => `<g transform="translate(${cx} ${cy}) scale(${r})" fill="none" stroke="${trazo}" stroke-width="0.09" stroke-linecap="round" stroke-linejoin="round"${extra}>${d}</g>`;
+    const base = color ? `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${color}"/>` : "";
+    const contra = color || "#fff";                 // color para lo que se dibuja sobre un relleno
+    const R = `fill="${trazo}" stroke="none"`;      // figura rellena
+    const DIBUJOS = {
+      escudo: `<path d="M0,-0.56 L0.44,-0.38 V0.02 C0.44,0.32 0.2,0.5 0,0.58 C-0.2,0.5 -0.44,0.32 -0.44,0.02 V-0.38 Z"/><path d="M-0.2,0.02 L-0.05,0.18 L0.22,-0.14"/>`,
+      visto: `<path d="M-0.36,0.02 L-0.1,0.28 L0.38,-0.26" stroke-width="0.16"/>`,
+      vistoAro: `<circle r="0.8"/><path d="M-0.34,0.02 L-0.1,0.26 L0.36,-0.24" stroke-width="0.16"/>`,
+      engranaje: `<circle r="0.33" stroke-width="0.17"/>` + [0, 45, 90, 135, 180, 225, 270, 315].map((a) => `<rect x="-0.1" y="-0.64" width="0.2" height="0.22" rx="0.03" fill="${trazo}" stroke="none" transform="rotate(${a})"/>`).join(""),
+      reloj: `<circle r="0.86" stroke-width="0.14"/><path d="M0,-0.46 V0 L0.3,0.2" stroke-width="0.14"/>`,
+      documento: `<path d="M-0.5,-0.9 H0.2 L0.55,-0.55 V0.9 H-0.5 Z M0.2,-0.9 V-0.55 H0.55" stroke-width="0.11"/><path d="M-0.28,-0.4 H0.1 M-0.28,-0.12 H0.3 M-0.28,0.16 H0.0" stroke-width="0.1"/>` +
+                 `<rect x="0.08" y="0.3" width="0.62" height="0.62" rx="0.08" ${R}/><path d="M0.2,0.5 H0.58 M0.2,0.7 H0.58 M0.39,0.42 V0.82" stroke="${contra}" stroke-width="0.07"/>`,
+      persona: `<circle cy="-0.32" r="0.27" ${R}/><path d="M-0.55,0.62 C-0.55,0.12 -0.25,0.04 0,0.04 C0.25,0.04 0.55,0.12 0.55,0.62 Z" ${R}/>`,
+      personas: `<circle cy="-0.3" r="0.22" ${R}/><path d="M-0.36,0.52 C-0.36,0.1 -0.16,0.02 0,0.02 C0.16,0.02 0.36,0.1 0.36,0.52 Z" ${R}/>` +
+                `<circle cx="-0.55" cy="-0.16" r="0.16" ${R}/><circle cx="0.55" cy="-0.16" r="0.16" ${R}/>` +
+                `<path d="M-0.44,0.52 C-0.44,0.3 -0.42,0.18 -0.36,0.1 C-0.6,0.02 -0.9,0.12 -0.9,0.52 Z" ${R}/><path d="M0.44,0.52 C0.44,0.3 0.42,0.18 0.36,0.1 C0.6,0.02 0.9,0.12 0.9,0.52 Z" ${R}/>`,
+      barras: `<rect x="-0.52" y="0.08" width="0.26" height="0.42" rx="0.04" ${R}/><rect x="-0.13" y="-0.18" width="0.26" height="0.68" rx="0.04" ${R}/><rect x="0.26" y="-0.48" width="0.26" height="0.98" rx="0.04" ${R}/>`,
+      portapapeles: `<rect x="-0.44" y="-0.5" width="0.88" height="1.08" rx="0.08"/><rect x="-0.2" y="-0.64" width="0.4" height="0.24" rx="0.06" ${R}/><path d="M-0.24,-0.12 H0.24 M-0.24,0.12 H0.24 M-0.24,0.36 H0.08"/>`,
+      diana: `<circle r="0.6"/><circle r="0.32"/><circle r="0.09" ${R}/><path d="M0.06,-0.06 L0.62,-0.62 M0.4,-0.64 H0.64 V-0.4"/>`,
+      calendario: `<rect x="-0.55" y="-0.45" width="1.1" height="1" rx="0.1"/><path d="M-0.55,-0.16 H0.55 M-0.28,-0.62 V-0.36 M0.28,-0.62 V-0.36"/>` +
+                  [-0.3, 0, 0.3].map((x) => [0.06, 0.32].map((y) => `<rect x="${x - 0.07}" y="${y - 0.07}" width="0.14" height="0.14" ${R}/>`).join("")).join(""),
+      historial: `<path d="M-0.7,-0.2 A0.74,0.74 0 1 1 -0.58,0.46" stroke-width="0.13"/><path d="M-0.95,-0.42 L-0.7,-0.16 L-0.4,-0.38" stroke-width="0.13"/><path d="M0.04,-0.38 V0.04 L0.34,0.22" stroke-width="0.13"/>`,
+      docVisto: `<path d="M-0.56,-0.74 H0.1 L0.4,-0.44 V0.2 M0.02,0.62 H-0.56 V-0.74" stroke-width="0.1"/><path d="M-0.32,-0.34 H0.14 M-0.32,-0.08 H0.14 M-0.32,0.18 H-0.02" stroke-width="0.1"/>` +
+                `<circle cx="0.36" cy="0.5" r="0.34" ${R}/><path d="M0.2,0.5 L0.32,0.63 L0.54,0.38" stroke="${contra}" stroke-width="0.1"/>`,
+      docLupa: `<path d="M-0.5,-0.72 H0.14 L0.44,-0.42 V0.02 M-0.02,0.66 H-0.5 V-0.72" stroke-width="0.1"/><path d="M-0.28,-0.34 H0.18 M-0.28,-0.08 H0.0" stroke-width="0.1"/>` +
+               `<circle cx="0.26" cy="0.36" r="0.22" stroke-width="0.1"/><path d="M0.42,0.52 L0.64,0.74" stroke-width="0.13"/>`,
+      docEngranaje: `<path d="M-0.5,-0.72 H0.14 L0.44,-0.42 V-0.06 M-0.08,0.66 H-0.5 V-0.72" stroke-width="0.1"/><path d="M-0.28,-0.34 H0.18 M-0.28,-0.08 H0.0 M-0.28,0.18 H-0.06" stroke-width="0.1"/>` +
+                    `<circle cx="0.34" cy="0.4" r="0.1" stroke-width="0.09"/><circle cx="0.34" cy="0.4" r="0.24" stroke-width="0.14" stroke-dasharray="0.125 0.064"/>`,
+      docs: `<path d="M-0.2,-0.5 V-0.8 H0.34 L0.66,-0.48 V0.5 H0.38" stroke-width="0.09"/>` +
+            `<path d="M-0.62,-0.5 H-0.02 L0.3,-0.18 V0.8 H-0.62 Z" stroke-width="0.09"/><path d="M-0.4,-0.02 H0.08 M-0.4,0.22 H0.08 M-0.4,0.46 H0.08" stroke-width="0.09"/>`,
+      casco: `<path d="M-0.5,0.02 C-0.5,-0.68 0.5,-0.68 0.5,0.02 Z" ${R}/><rect x="-0.66" y="0.02" width="1.32" height="0.16" rx="0.08" ${R}/>` +
+             `<path d="M-0.5,0.82 C-0.5,0.4 -0.24,0.34 0,0.34 C0.24,0.34 0.5,0.4 0.5,0.82 Z" ${R}/>`,
+      fabrica: `<path d="M-0.7,0.62 V0.02 L-0.32,0.28 V0.02 L0.06,0.28 V-0.62 H0.36 V0.28 H0.7 V0.62 Z" ${R}/>` +
+               `<path d="M-0.5,0.44 H-0.34 M-0.14,0.44 H0.02 M0.22,0.44 H0.38" stroke="${contra}" stroke-width="0.1"/>`,
+      puente: `<path d="M-0.8,0.3 H0.8 M-0.46,-0.5 V0.56 M0.46,-0.5 V0.56 M-0.8,0.12 C-0.62,-0.06 -0.52,-0.28 -0.46,-0.44 C-0.3,0.08 0.3,0.08 0.46,-0.44 C0.52,-0.28 0.62,-0.06 0.8,0.12" stroke-width="0.1"/>` +
+              `<path d="M-0.22,-0.02 V0.3 M0,0.06 V0.3 M0.22,-0.02 V0.3" stroke-width="0.07"/>`,
+      cilindros: `<ellipse cy="-0.44" rx="0.5" ry="0.18" stroke-width="0.1"/><path d="M-0.5,-0.44 V0.44 C-0.5,0.68 0.5,0.68 0.5,0.44 V-0.44 M-0.5,-0.14 C-0.5,0.1 0.5,0.1 0.5,-0.14 M-0.5,0.16 C-0.5,0.4 0.5,0.4 0.5,0.16" stroke-width="0.1"/>`,
+      surtidor: `<rect x="-0.52" y="-0.66" width="0.64" height="1.32" rx="0.08" ${R}/><rect x="-0.4" y="-0.52" width="0.4" height="0.34" rx="0.04" fill="${contra}" stroke="none"/>` +
+                `<path d="M0.12,-0.08 H0.3 V0.42 C0.3,0.6 0.56,0.6 0.56,0.42 V-0.3 L0.36,-0.52" stroke-width="0.1"/>`,
+      monedas: [0, 1, 2].map((i) => `<ellipse cx="-0.3" cy="${(0.44 - i * 0.18).toFixed(2)}" rx="0.3" ry="0.12" fill="${trazo}" stroke="${contra}" stroke-width="0.045"/>`).join("") +
+               [0, 1, 2, 3, 4].map((i) => `<ellipse cx="0.3" cy="${(0.44 - i * 0.18).toFixed(2)}" rx="0.3" ry="0.12" fill="${trazo}" stroke="${contra}" stroke-width="0.045"/>`).join(""),
+    };
+    return this.add(base + g(DIBUJOS[nombre]));
+  }
+
+  // Texto. o: tam, peso (400, 600, 700), color, ancla (start | middle | end), ancho (envuelve),
+  // inter (alto de linea en veces el tamaño), centroY (y es el centro del bloque), encoger (ancho
+  // maximo de una sola linea), campo (va como cuadro de texto editable en el pptx), parrafo
+  // (en el pptx, un solo cuadro que envuelve, de `alto` pixeles). Devuelve la y de la linea siguiente.
+  texto(x, y, cadena, o = {}) {
+    let tam = o.tam || 28;
+    const peso = o.peso || 400, color = o.color || "#111", ancla = o.ancla || "start", inter = o.inter || 1.22;
+    const pesoDe = (b) => (b ? 700 : peso);
+    let lineas = [];
+    for (const parte of String(cadena).split("\n")) {
+      if (!o.ancho) { lineas.push(tramos(parte)); continue; }
+      let actual = [], w = 0;
+      const espacio = anchoDe(" ", tam, peso);
+      for (const tr of tramos(parte)) for (const palabra of tr.t.split(/ +/).filter(Boolean)) {
+        const wp = anchoDe(palabra, tam, pesoDe(tr.b));
+        if (actual.length && w + espacio + wp > o.ancho) { lineas.push(actual); actual = []; w = 0; }
+        const ultimo = actual[actual.length - 1];
+        if (ultimo && ultimo.b === tr.b) ultimo.t += " " + palabra;
+        else { if (ultimo) ultimo.t += " "; actual.push({ t: palabra, b: tr.b }); }
+        w += (actual.length > 1 || ultimo ? espacio : 0) + wp;
+      }
+      lineas.push(actual);
+    }
+    const anchoLinea = (l) => l.reduce((s, tr) => s + anchoDe(tr.t, tam, pesoDe(tr.b)), 0);
+    if (o.encoger && lineas.length === 1) {
+      const w = anchoLinea(lineas[0]);
+      if (w > o.encoger) tam = Math.floor(tam * o.encoger / w);
+    }
+    const paso = tam * inter;
+    let y0 = y;
+    if (o.centroY) y0 = y - (lineas.length - 1) * paso / 2 + tam * 0.35;
+    const destino = o.campo ? this.frente : this.fondo;
+    lineas.forEach((l, i) => {
+      if (!l.length) return;
+      destino.push(`<text x="${x}" y="${(y0 + i * paso).toFixed(1)}" font-family='${FUENTE}' font-size="${tam}" font-weight="${peso}" fill="${color}" text-anchor="${ancla}" xml:space="preserve">` +
+        l.map((tr) => (tr.b && peso < 700 ? `<tspan font-weight="700">${esc(tr.t)}</tspan>` : esc(tr.t))).join("") + "</text>");
+    });
+    if (o.campo) {
+      this.campos.push({ x, y: y0, lineas, tam, peso, color, ancla, paso, ancho: o.ancho || 0, parrafo: !!o.parrafo, alto: o.alto || 0,
+                         anchos: lineas.map(anchoLinea) });
+    }
+    return y0 + lineas.length * paso;
+  }
+  // Texto de la pestaña TEXTOS: es campo editable si lleva algun {dato}.
+  rotulo(x, y, clave, o = {}) { return this.texto(x, y, texto(clave), { campo: tieneDato(clave), ...o }); }
+  // Dato suelto de la pestaña DATOS: siempre editable.
+  cifra(x, y, clave, o = {}) { return this.texto(x, y, (o.antes || "") + dato(clave), { campo: true, ...o }); }
+
+  svg(conCampos = true) {
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${ANCHO} ${ALTO}" width="${ANCHO}" height="${ALTO}">` +
+      `<defs>${this.defs.join("")}</defs><rect width="${ANCHO}" height="${ALTO}" fill="#fff"/>` +
+      this.fondo.join("") + (conCampos ? this.frente.join("") : "") + "</svg>";
+  }
+}
+
+// ------------------------------------------------------------- piezas comunes
+const C = {
+  azul: "#0b1f6b", azulTexto: "#1f2f7a", celeste: "#1ba0e3",
+  rojo: "#c62828", rojoOscuro: "#b71c1c", rojoFondo: "#fbe6e6",
+  azulFondo: "#e6f0fb", azulMedio: "#2f80d0", azulRotulo: "#1f5fae", azulIcono: "#1f66c8",
+  verde: "#176b3a", verdeOscuro: "#14532d", verdeTexto: "#1b6b3c", verdeFondo: "#e4f2e7", verdeCaja: "#d3e8d9", verdePista: "#cfe5d5",
+  lila: "#6f6aa8", lilaOscuro: "#3b3a7a",
+};
+
+function titulo(L, clave) {
+  L.rect(40, 28, 14, 78, { fill: C.celeste });
+  L.rotulo(74, 94, clave, { tam: 84, peso: 700, color: C.azul, encoger: 1790 });
+}
+// Bloque con pestaña de color y numero en un circulo, con una etiqueta opcional debajo del numero.
+function bloqueNumerado(L, x, y, w, h, n, colorPestana, colorCirculo, fill, foto, fotoAncho, etiqueta) {
+  const pa = 122;
+  L.panel(x, y, w, h, fill, { pestana: colorPestana, pestanaAncho: pa, foto, fotoAncho });
+  const cx = x + pa / 2, cy = y + h / 2 - (etiqueta ? 24 : 0);
+  L.circulo(cx, cy, 46, { fill: colorCirculo, stroke: "#fff", sw: 6 });
+  L.texto(cx, cy + 21, String(n), { tam: 60, peso: 700, color: "#fff", ancla: "middle" });
+  if (etiqueta) L.texto(cx, cy + 90, etiqueta, { tam: 30, peso: 700, color: "#fff", ancla: "middle", encoger: pa - 12 });
+}
+
+// ------------------------------------------------------------- lamina 1: periodo
+function lamina1() {
+  const L = new Lienzo(1);
+  titulo(L, "l1.titulo");
+
+  // 1. gestion operativa
+  bloqueNumerado(L, 30, 128, 770, 288, 1, C.rojo, C.rojoOscuro, C.rojoFondo, FOTOS.pila, 290);
+  L.rotulo(338, 196, "l1.gestion.titulo", { tam: 42, peso: 600, color: C.azulTexto, ancla: "middle", encoger: 350 });
+  L.cifra(338, 318, "poi.cerrados", { tam: 116, peso: 700, color: C.rojoOscuro, ancla: "middle", encoger: 330 });
+  L.rotulo(338, 378, "l1.gestion.rotulo", { tam: 38, peso: 700, color: C.rojo, ancla: "middle", encoger: 350 });
+  // hoja del calendario de la foto
+  L.rotulo(729, 258, "l1.calendario", { tam: 24, peso: 700, color: C.rojoOscuro, ancla: "middle", encoger: 124 });
+  L.add(`<ellipse cx="729" cy="297" rx="58" ry="27" fill="none" stroke="${C.rojo}" stroke-width="4"/>`);
+  L.cifra(729, 307, "periodo.mes_corto", { tam: 28, peso: 700, color: C.azul, ancla: "middle", encoger: 96 });
+  L.cifra(729, 362, "periodo.dias", { tam: 32, peso: 700, color: C.azul, ancla: "middle", encoger: 124 });
+
+  // meta POI
+  L.panel(814, 128, 1076, 288, C.verdeFondo);
+  L.icono("escudo", 902, 214, 62, C.verdeOscuro);
+  L.rotulo(1124, 192, "l1.poi.titulo", { tam: 42, peso: 600, color: C.verdeTexto, ancla: "middle", encoger: 300 });
+  L.rotulo(1124, 256, "l1.poi.texto", { tam: 38, peso: 600, color: C.verdeTexto, ancla: "middle", ancho: 310, inter: 1.34 });
+  L.anillo(1404, 272, 116, 30, numero("poi.avance"), C.verde, C.verdePista);
+  L.cifra(1404, 284, "poi.avance", { tam: 58, peso: 700, color: C.verdeOscuro, ancla: "middle", encoger: 150 });
+  L.rotulo(1404, 320, "l1.poi.avance", { tam: 25, peso: 600, color: C.verdeOscuro, ancla: "middle" });
+  L.linea(1542, 170, 1542, 374, "#9dbfa8", 2);
+  L.rect(1560, 190, 316, 164, { fill: C.verdeCaja, r: 14 });
+  L.icono("visto", 1606, 272, 32, C.verdeOscuro);
+  L.rotulo(1760, 272, "l1.poi.detalle", { tam: 27, peso: 600, color: C.verdeTexto, ancla: "middle", ancho: 232, inter: 1.28, centroY: true });
+
+  // 2. sanciones economicas
+  bloqueNumerado(L, 30, 432, 770, 288, 2, C.azulMedio, C.azul, C.azulFondo, FOTOS.folder, 290);
+  L.rotulo(338, 500, "l1.multas.titulo", { tam: 42, peso: 600, color: C.azulTexto, ancla: "middle", encoger: 350 });
+  L.cifra(338, 620, "multas.uit", { tam: 108, peso: 700, color: C.azul, ancla: "middle", encoger: 350 });
+  L.rotulo(338, 688, "l1.multas.rotulo", { tam: 38, peso: 600, color: C.azulTexto, ancla: "middle", encoger: 350 });
+  L.cifra(640, 584, "periodo.etiqueta", { tam: 28, peso: 700, color: C.azul, ancla: "middle", encoger: 176 });
+  L.rect(548, 640, 238, 70, { fill: "#fff", r: 10, op: 0.9 });
+  L.cifra(667, 674, "multas.soles", { antes: "S/ ", tam: 30, peso: 700, color: C.azul, ancla: "middle", encoger: 222 });
+  L.rotulo(667, 699, "l1.multas.soles", { tam: 18, color: C.azulTexto, ancla: "middle", encoger: 222 });
+
+  // RSD e IFI
+  L.panel(814, 432, 1076, 288, C.azulFondo);
+  L.icono("escudo", 902, 522, 62, C.azulIcono);
+  [["l1.rsd", "rsd.total", 452], ["l1.ifi", "ifi.total", 588]].forEach(([rot, clave, y]) => {
+    L.rotulo(994, y + 80, rot, { tam: 60, peso: 700, color: C.azulRotulo, encoger: 620 });
+    L.rect(1644, y, 190, 116, { fill: "#e3f3ff", stroke: "#2b56b0", sw: 6 });
+    L.cifra(1739, y + 86, clave, { tam: 78, color: C.azulRotulo, ancla: "middle", encoger: 170 });
+  });
+
+  // 3. ranking
+  bloqueNumerado(L, 30, 736, 1366, 304, 3, C.lila, C.lilaOscuro, "#e3f1e5");
+  L.icono("engranaje", 216, 796, 40, C.verde);
+  L.rotulo(272, 810, "l1.ranking.titulo", { tam: 40, peso: 700, color: C.verdeTexto, encoger: 480 });
+  L.rect(272, 834, 250, 52, { fill: C.verde, r: 26 });
+  L.icono("vistoAro", 302, 860, 17, null);
+  L.rotulo(330, 871, "l1.ranking.estado", { tam: 30, peso: 600, color: "#fff", encoger: 176 });
+  L.icono("documento", 214, 962, 50, null, C.azul);
+  L.rotulo(272, 930, "l1.ranking.alcance", { tam: 25, color: "#1f2f4a", ancho: 216, inter: 1.26 });
+  L.linea(506, 902, 506, 1022, "#9dbfa8", 2);
+  L.icono("reloj", 556, 950, 32, null, C.azul);
+  L.rotulo(604, 944, "l1.ranking.multa", { tam: 36, peso: 700, color: C.azul, ancho: 170, inter: 1.2 });
+  tablaRanking(L, 782, 752, 600, 276);
+
+  // principales infracciones
+  L.panel(1410, 736, 480, 304, C.rojoFondo);
+  L.rotulo(1650, 794, "l1.infracciones.titulo", { tam: 36, peso: 700, color: C.rojoOscuro, ancla: "middle", encoger: 440 });
+  L.rotulo(1436, 842, "l1.infracciones.texto", { tam: 24, color: "#3a1f1f", ancho: 428, inter: 1.3, campo: true, parrafo: true, alto: 200 });
+  return L;
+}
+
+// Tabla del ranking: encabezado y hasta 5 filas (las que traiga la pestaña RANKING).
+function tablaRanking(L, x, y, w, h) {
+  const filas = D.ranking.slice(0, 5), altoEnc = 52, altoFila = (h - altoEnc) / 5, w1 = Math.round(w * 0.68), borde = C.azul;
+  L.rect(x, y, w, altoEnc, { fill: C.azul });
+  L.rotulo(x + w1 / 2, y + 36, "l1.ranking.col1", { tam: 26, peso: 700, color: "#fff", ancla: "middle" });
+  L.rotulo(x + w1 + (w - w1) / 2, y + 36, "l1.ranking.col2", { tam: 26, peso: 700, color: "#fff", ancla: "middle" });
+  L.rect(x, y + altoEnc, w, altoFila * filas.length, { fill: "#fff" });
+  filas.forEach(([nombre, monto], i) => {
+    const yb = y + altoEnc + altoFila * i;
+    L.linea(x, yb + altoFila, x + w, yb + altoFila, borde, 1.5);
+    L.texto(x + 14, yb + altoFila / 2 + 9, nombre, { tam: 24, color: "#111", encoger: w1 - 28, campo: true });
+    L.texto(x + w - 16, yb + altoFila / 2 + 9, typeof monto === "number" ? miles(monto, 3) : String(monto ?? ""),
+            { tam: 24, color: "#111", ancla: "end", campo: true });
+  });
+  const alto = altoEnc + altoFila * filas.length;
+  L.rect(x, y, w, alto, { stroke: borde, sw: 2 });
+  L.linea(x + w1, y, x + w1, y + alto, borde, 1.5);
+}
+
+// ------------------------------------------------------------- lamina 2: eje I
+// Texto "A | B | C" de la pestaña TEXTOS partido en sus partes.
+const partes = (clave) => texto(clave).split("|").map((p) => p.trim());
+
+// Caja pequeña del organigrama. "E1" se escribe con el numero como subindice.
+function ficha(L, x, y, w, h, rotulo) {
+  L.rect(x, y, w, h, { fill: "#fff", stroke: "#d4d4d8", sw: 1.5, r: 7 });
+  const m = /^(\D+)(\d+)$/.exec(rotulo);
+  if (!m) { L.texto(x + w / 2, y + h / 2 + 9, rotulo, { tam: 25, color: "#1f2f4a", ancla: "middle", encoger: w - 8 }); return; }
+  L.add(`<text x="${x + w / 2}" y="${y + h / 2 + 9}" font-family='${FUENTE}' font-size="26" fill="#1f2f4a" text-anchor="middle">${esc(m[1])}` +
+        `<tspan font-size="16" dy="7">${esc(m[2])}</tspan></text>`);
+}
+
+// Columna del organigrama: cabecera con icono, nombre y rol, y debajo sus fichas.
+function columnaOrg(L, x, y, w, h, clave, icono, colorCab, colorCuerpo, porFila) {
+  const [nombre, rol, lista] = partes(clave), altoCab = 70;
+  L.panel(x, y, w, h, colorCuerpo, { r: 10, cabecera: { alto: altoCab, fill: colorCab } });
+  L.icono(icono, x + 50, y + altoCab / 2, 25, null, C.azul);
+  L.texto(x + 92, y + 31, nombre || "", { tam: 27, peso: 700, color: C.azul, encoger: w - 100 });
+  L.texto(x + 92, y + 58, rol || "", { tam: 22, color: "#1f2f4a", encoger: w - 100 });
+  const fichas = (lista || "").split(",").map((s) => s.trim()).filter(Boolean), fw = 56, fh = 48, sep = 10;
+  fichas.forEach((f, i) => {
+    const fila = Math.floor(i / porFila), enFila = Math.min(porFila, fichas.length - fila * porFila);
+    const x0 = x + (w - (enFila * fw + (enFila - 1) * sep)) / 2;
+    ficha(L, x0 + (i % porFila) * (fw + sep), y + altoCab + 16 + fila * (fh + 12), fw, fh, f);
+  });
+}
+
+function lamina2() {
+  const L = new Lienzo(2);
+  titulo(L, "l2.titulo");
+  L.rotulo(74, 140, "l2.subtitulo", { tam: 36, color: C.azulTexto, encoger: 1780 });
+  // Los dos paneles de abajo se pintan primero: la tarjeta de prescripcion evitada baja sobre ellos.
+  L.panel(30, 512, 1250, 408, "#eaf2fb");
+  L.panel(1292, 512, 598, 408, "#eaf2fb");
+
+  // total del eje
+  L.panel(30, 160, 344, 340, C.rojoFondo);
+  L.icono("documento", 96, 232, 50, C.rojo);
+  L.rotulo(162, 206, "l2.total.rotulo", { tam: 26, peso: 700, color: C.azul, ancho: 206, inter: 1.2 });
+  L.cifra(202, 432, "eje1.total", { tam: 150, peso: 700, color: C.rojo, ancla: "middle", encoger: 310 });
+  L.rotulo(202, 480, "l2.unidad", { tam: 40, peso: 700, color: C.rojo, ancla: "middle", encoger: 310 });
+
+  // concluidos
+  L.panel(384, 160, 356, 340, C.azulFondo);
+  L.icono("visto", 440, 232, 42, "#1e88e5");
+  L.rotulo(496, 228, "l2.concluidos.titulo", { tam: 32, peso: 700, color: C.azul, encoger: 232 });
+  L.rotulo(496, 262, "l2.concluidos.fecha", { tam: 24, color: C.azulTexto, encoger: 232 });
+  L.cifra(478, 392, "eje1.concluidos", { tam: 88, peso: 700, color: C.azul, ancla: "middle", encoger: 172 });
+  L.rotulo(478, 434, "l2.unidad", { tam: 29, peso: 700, color: C.azulRotulo, ancla: "middle", encoger: 172 });
+  L.linea(574, 332, 574, 448, "#9db4d6", 2);
+  L.cifra(656, 380, "eje1.concluidos_pct", { tam: 44, peso: 700, color: C.azul, ancla: "middle", encoger: 150 });
+  L.rotulo(656, 420, "l2.avance", { tam: 24, color: C.azulTexto, ancla: "middle", encoger: 150 });
+
+  // prescripcion evitada
+  L.rect(746, 144, 508, 396, { fill: "#fff", r: 20 });
+  L.panel(750, 148, 500, 388, "#e0f3e3");
+  L.icono("escudo", 812, 204, 44, C.verdeOscuro);
+  L.rotulo(872, 214, "l2.evitada.titulo", { tam: 31, peso: 700, color: C.verdeTexto, encoger: 366 });
+  L.cifra(884, 328, "eje1.evitada", { tam: 94, peso: 700, color: C.verde, ancla: "middle", encoger: 232 });
+  L.rotulo(884, 368, "l2.unidad", { tam: 30, peso: 700, color: C.verde, ancla: "middle", encoger: 232 });
+  L.rect(780, 382, 208, 58, { fill: C.verdeOscuro, r: 8 });
+  L.cifra(884, 426, "eje1.evitada_pct", { tam: 42, peso: 700, color: "#fff", ancla: "middle", encoger: 192 });
+  L.rotulo(884, 466, "l2.avance", { tam: 23, peso: 600, color: C.verdeTexto, ancla: "middle" });
+  L.rotulo(884, 494, "l2.evitada.nota", { tam: 20, color: "#1f2f4a", ancla: "middle", ancho: 260, inter: 1.2 });
+  L.anillo(1124, 352, 104, 30, numero("eje1.evitada_pct"), C.verde, "#cfd8d2");
+  L.cifra(1124, 361, "eje1.evitada_pct", { tam: 40, peso: 700, color: C.verdeOscuro, ancla: "middle", encoger: 132 });
+  L.rotulo(1124, 391, "l2.avance", { tam: 21, peso: 600, color: C.verdeOscuro, ancla: "middle" });
+
+  // cronograma: ilustracion fija, una barra por cada rotulo de la lista
+  L.panel(1260, 160, 630, 340, "#fdf1d6");
+  L.icono("calendario", 1318, 220, 46, "#e8a317");
+  L.rotulo(1380, 204, "l2.cronograma.titulo", { tam: 26, peso: 700, color: C.azul, encoger: 492 });
+  L.rotulo(1380, 234, "l2.cronograma.texto", { tam: 20, color: "#1f2f4a", ancho: 492, inter: 1.25 });
+  const semanas = texto("l2.cronograma.semanas").split(",").map((s) => s.trim()).filter(Boolean);
+  const bx = 1286, bw = 580, base = 456, altoMax = 136, paso = bw / Math.max(semanas.length, 1);
+  const grad = L.id("g");
+  L.defs.push(`<linearGradient id="${grad}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#1558c0"/><stop offset="1" stop-color="#3f9ff0"/></linearGradient>`);
+  const alturas = semanas.map((_, i) => altoMax * (0.14 + 0.86 * Math.pow(1 - i / Math.max(semanas.length - 1, 1), 1.9)));
+  semanas.forEach((s, i) => {
+    L.add(`<rect x="${(bx + i * paso + paso * 0.14).toFixed(1)}" y="${(base - alturas[i]).toFixed(1)}" width="${(paso * 0.72).toFixed(1)}" height="${alturas[i].toFixed(1)}" rx="3" fill="url(#${grad})"/>`);
+    L.texto(bx + i * paso + paso / 2, base + 26, s, { tam: 16, color: "#1f2f4a", ancla: "middle", encoger: paso - 4 });
+  });
+  if (semanas.length > 1) {
+    const x1 = bx + paso / 2, y1 = base - alturas[0] - 14, x2 = bx + bw - paso * 0.3, y2 = base - alturas[semanas.length - 1] - 20;
+    L.add(`<path d="M${x1},${y1.toFixed(1)} Q${(x1 + (x2 - x1) * 0.35).toFixed(1)},${(y2 - 6).toFixed(1)} ${x2.toFixed(1)},${y2.toFixed(1)}" fill="none" stroke="#1e88e5" stroke-width="2.5"/>` +
+          `<path d="M${(x2 - 12).toFixed(1)},${(y2 - 9).toFixed(1)} L${(x2 + 4).toFixed(1)},${y2.toFixed(1)} L${(x2 - 12).toFixed(1)},${(y2 + 8).toFixed(1)} Z" fill="#1e88e5"/>`);
+  }
+  L.linea(bx, base, bx + bw, base, "#9db4d6", 2);
+
+  // organizacion
+  L.rotulo(58, 558, "l2.organizacion.titulo", { tam: 30, peso: 700, color: C.azul, encoger: 1190 });
+  const cabeza = partes("l2.org.cabeza");
+  L.rect(480, 572, 410, 86, { fill: "#a9d6f5", r: 10 });
+  L.texto(660, 606, cabeza[0] || "", { tam: 34, peso: 700, color: C.azul, ancla: "middle", encoger: 280 });
+  L.texto(660, 630, cabeza[1] || "", { tam: 20, color: "#1f2f4a", ancla: "middle", encoger: 280 });
+  L.texto(660, 651, cabeza[2] || "", { tam: 19, color: "#1f2f4a", ancla: "middle", encoger: 280 });
+  L.icono("persona", 838, 616, 30, null, C.azul);
+  const cols = [["l2.org.col1", "casco", "#fbe39c", "#fdf4d6", 86, 316, 4], ["l2.org.col2", "fabrica", "#f3c5cf", "#fbe5ea", 414, 294, 3],
+                ["l2.org.col3", "puente", "#fbd3a0", "#fdecd6", 720, 250, 3], ["l2.org.col4", "cilindros", "#cfe7a8", "#e8f5d6", 982, 284, 3]];
+  L.linea(685, 658, 685, 676, "#1f2f4a", 2);
+  L.linea(cols[0][4] + cols[0][5] / 2, 676, cols[3][4] + cols[3][5] / 2, 676, "#1f2f4a", 2);
+  cols.forEach(([clave, ico, cab, cuerpo, x, w, porFila]) => {
+    L.linea(x + w / 2, 676, x + w / 2, 694, "#1f2f4a", 2);
+    columnaOrg(L, x, 694, w, 208, clave, ico, cab, cuerpo, porFila);
+  });
+
+  // seguimiento y control
+  L.rotulo(1316, 558, "l2.control.titulo", { tam: 30, peso: 700, color: C.azul, encoger: 550 });
+  [["personas", "#1e88e5"], ["barras", "#1e8e3e"], ["portapapeles", "#e8a317"], ["diana", "#6a1b9a"]].forEach(([ico, color], i) => {
+    const cy = 618 + i * 84;
+    L.icono(ico, 1350, cy, 34, color);
+    L.rect(1404, cy - 36, 470, 72, { fill: "#dde9f7", r: 8 });
+    L.rotulo(1420, cy, "l2.control." + (i + 1), { tam: 20, color: "#1f2f4a", ancho: 440, inter: 1.18, centroY: true });
+  });
+
+  // objetivo
+  L.panel(30, 932, 1860, 126, "#dbe8f8");
+  L.icono("historial", 112, 995, 46, null, C.azul);
+  L.rotulo(196, 976, "l2.objetivo.titulo", { tam: 29, peso: 700, color: C.azul });
+  L.rotulo(196, 1010, "l2.objetivo.texto", { tam: 25, color: "#1f2f4a", ancho: 760, inter: 1.22 });
+  L.linea(1010, 952, 1010, 1038, "#1f2f4a", 2);
+  L.icono("docVisto", 1110, 995, 46, null, C.azul);
+  L.rotulo(1196, 976, "l2.asignados.titulo", { tam: 29, peso: 700, color: C.azul });
+  L.rotulo(1196, 1010, "l2.asignados.texto", { tam: 25, color: "#1f2f4a", ancho: 640, inter: 1.22 });
+  return L;
+}
+
+// ------------------------------------------------------------- lamina 3: eje II
+// Fila blanca con icono, rotulo, cifra y unidad.
+function filaEstado(L, x, y, w, h, icono, colorBase, trazo, claveRotulo, claveDato, tamCifra) {
+  L.rect(x, y, w, h, { fill: "#fff", r: 14, op: 0.9 });
+  L.icono(icono, x + h * 0.52, y + h / 2, h * 0.38, colorBase, trazo);
+  L.rotulo(x + h * 1.02, y + h / 2, claveRotulo, { tam: h * 0.25, peso: 700, color: C.azul, ancho: w * 0.34, inter: 1.12, centroY: true });
+  const xd = x + w * 0.58;
+  L.linea(xd, y + 16, xd, y + h - 16, C.azul, 2);
+  L.cifra(xd + 22, y + h * 0.56, claveDato, { tam: tamCifra, peso: 700, color: C.azul, encoger: w * 0.36 });
+  L.rotulo(xd + 22, y + h * 0.86, "l3.unidad", { tam: h * 0.22, color: C.azul, encoger: w * 0.36 });
+}
+
+// Tarjeta de una coordinacion: cabecera con icono y nombre, y debajo sus expedientes.
+function tarjetaCoord(L, x, y, w, h, n, icono, color, colorCab, colorCuerpo) {
+  L.panel(x, y, w, h, colorCuerpo, { r: 10, cabecera: { alto: 78, fill: colorCab } });
+  L.icono(icono, x + 40, y + 39, 27, null, color);
+  L.rotulo(x + 80, y + 40, `l3.coord${n}.nombre`, { tam: 21, peso: 700, color: C.azul, ancho: w - 92, inter: 1.15, centroY: true });
+  L.icono("personas", x + 62, y + 136, 38, null, color);
+  L.rotulo(x + w * 0.66, y + 150, `l3.coord${n}.expedientes`, { tam: 62, peso: 700, color, ancla: "middle", campo: true, encoger: w * 0.5 });
+  L.rotulo(x + w * 0.66, y + 184, "l3.unidad", { tam: 25, peso: 700, color, ancla: "middle", encoger: w * 0.56 });
+}
+
+function lamina3() {
+  const L = new Lienzo(3), marino = "#0d3b82";
+  titulo(L, "l3.titulo");
+  const FILAS = [["docLupa", "#bfe0f7", C.azul, "l3.eai", "eai"], ["docEngranaje", "#fde3a7", C.azul, "l3.iniciados", "iniciados"],
+                 ["visto", "#cdebd0", "#1e8e3e", "l3.concluidos", "concluidos"]];
+
+  // columna del total
+  L.panel(30, 132, 326, 908, marino);
+  L.icono("docs", 193, 290, 84, null, "#fff");
+  L.rotulo(193, 432, "l3.total.rotulo", { tam: 38, peso: 700, color: "#fff", ancla: "middle", ancho: 290, inter: 1.22 });
+  L.linea(30, 610, 356, 610, "#fff", 2);
+  L.linea(356, 610, 1890, 610, "#2b3a8c", 1.5);
+  L.cifra(193, 826, "eje2.total", { tam: 150, peso: 700, color: "#fff", ancla: "middle", encoger: 296 });
+  L.rotulo(193, 884, "l3.unidad", { tam: 42, peso: 700, color: "#fff", ancla: "middle", encoger: 296 });
+
+  // equipo regular
+  L.panel(370, 132, 1520, 466, "#e3f0fb");
+  L.icono("docs", 446, 366, 66, null, C.azul);
+  L.cifra(680, 414, "eje2.regular.total", { tam: 168, peso: 700, color: C.azul, ancla: "middle", encoger: 320 });
+  L.rotulo(680, 468, "l3.unidad", { tam: 44, peso: 700, color: C.azul, ancla: "middle", encoger: 320 });
+  L.linea(856, 172, 856, 560, "#2b3a8c", 2);
+  FILAS.forEach(([ico, base, trazo, rot, clave], i) => filaEstado(L, 878, 164 + i * 136, 516, 116, ico, base, trazo, rot, "eje2.regular." + clave, 60));
+  L.linea(1416, 172, 1416, 560, "#2b3a8c", 2);
+  L.rotulo(1452, 366, "l3.regular.texto", { tam: 46, color: C.azul, ancho: 410, inter: 1.22, centroY: true });
+
+  // equipo adicional
+  L.panel(370, 622, 1520, 418, "#e9f6ea");
+  L.icono("visto", 444, 790, 56, C.verde);
+  L.cifra(648, 818, "eje2.adicional.total", { tam: 128, peso: 700, color: C.verde, ancla: "middle", encoger: 270 });
+  L.rotulo(648, 862, "l3.unidad", { tam: 38, peso: 700, color: C.verde, ancla: "middle", encoger: 270 });
+  L.rect(516, 894, 264, 74, { fill: "#cfeacc", r: 10 });
+  L.rotulo(648, 944, "l3.adicional.pct", { tam: 34, peso: 700, color: C.verdeTexto, ancla: "middle", encoger: 244 });
+  L.linea(802, 656, 802, 1006, "#2b3a8c", 2);
+  FILAS.forEach(([ico, base, trazo, rot, clave], i) => filaEstado(L, 822, 650 + i * 124, 446, 104, ico, base, trazo, rot, "eje2.adicional." + clave, 54));
+  L.linea(1288, 656, 1288, 1006, "#2b3a8c", 2);
+  L.rotulo(1590, 682, "l3.adicional.titulo", { tam: 44, peso: 700, color: C.azul, ancla: "middle", encoger: 570 });
+  L.rect(1308, 702, 564, 80, { fill: "#cfe4f8", r: 8 });
+  L.rotulo(1590, 742, "l3.adicional.texto", { tam: 23, color: "#1f2f4a", ancla: "middle", ancho: 536, inter: 1.25, centroY: true });
+  L.linea(1590, 782, 1590, 798, "#2b3a8c", 2);
+  L.linea(1448, 798, 1738, 798, "#2b3a8c", 2);
+  L.linea(1448, 798, 1448, 812, "#2b3a8c", 2);
+  L.linea(1738, 798, 1738, 812, "#2b3a8c", 2);
+  tarjetaCoord(L, 1306, 812, 284, 204, 1, "surtidor", "#e39a12", "#fde6b5", "#fef3da");
+  tarjetaCoord(L, 1602, 812, 272, 204, 2, "fabrica", C.verde, "#d6ecd2", "#eef8ec");
+  return L;
+}
+
+// ------------------------------------------------------------- lamina 4: resumen
+// Mitad derecha de una fila del resumen: escudo, cifra, anillo y nota.
+function avanceEje(L, y, eje, n, color, colorTexto, fill, pista, colorCaja, iconoNota) {
+  L.panel(814, y, 1076, 288, fill);
+  L.icono("escudo", 896, y + 84, 62, color);
+  L.rotulo(982, y + 66, `l4.eje${n}.evitada`, { tam: 34, peso: 700, color: colorTexto, encoger: 250 });
+  L.cifra(1104, y + 204, eje + ".evitada", { tam: 124, peso: 700, color: n === 1 ? C.verdeOscuro : C.azul, ancla: "middle", encoger: 250 });
+  L.rotulo(1104, y + 252, "l4.unidad", { tam: 36, peso: 700, color: n === 1 ? C.verdeOscuro : C.azul, ancla: "middle", encoger: 250 });
+  L.linea(1250, y + 56, 1250, y + 250, "#9db4b0", 2);
+  L.anillo(1394, y + 144, 118, 32, numero(eje + ".evitada_pct"), color, pista);
+  L.cifra(1394, y + 154, eje + ".evitada_pct", { tam: 46, peso: 700, color: n === 1 ? C.verdeOscuro : C.azul, ancla: "middle", encoger: 146 });
+  L.rotulo(1394, y + 188, "l4.avance", { tam: 23, peso: 600, color: n === 1 ? C.verdeOscuro : C.azul, ancla: "middle" });
+  L.linea(1538, y + 56, 1538, y + 250, "#9db4b0", 2);
+  L.rect(1556, y + 66, 320, 156, { fill: colorCaja, r: 14 });
+  L.icono(iconoNota, 1604, y + 144, 32, color);
+  L.rotulo(1652, y + 144, `l4.eje${n}.nota`, { tam: 22, color: n === 1 ? C.verdeTexto : C.azul, ancho: 212, inter: 1.22, centroY: true });
+}
+
+function lamina4() {
+  const L = new Lienzo(4);
+  titulo(L, "l4.titulo");
+  const y1 = 120, y2 = 424, y3 = 728;
+
+  // eje 1
+  bloqueNumerado(L, 30, y1, 770, 288, 1, C.rojo, C.rojoOscuro, C.rojoFondo, FOTOS.pila, 290, texto("l4.eje1.etiqueta"));
+  L.rotulo(180, y1 + 58, "l4.eje1.rotulo", { tam: 29, peso: 700, color: C.azul, ancho: 356, inter: 1.2 });
+  L.cifra(338, y1 + 226, "eje1.total", { tam: 122, peso: 700, color: C.rojo, ancla: "middle", encoger: 330 });
+  L.rotulo(338, y1 + 270, "l4.unidad", { tam: 36, peso: 700, color: C.rojo, ancla: "middle", encoger: 330 });
+  L.add(`<ellipse cx="729" cy="${y1 + 166}" rx="62" ry="30" fill="none" stroke="${C.rojo}" stroke-width="4"/>`);
+  L.rotulo(729, y1 + 177, "l4.eje1.sello", { tam: 30, peso: 700, color: "#111", ancla: "middle", encoger: 104 });
+  avanceEje(L, y1, "eje1", 1, C.verdeOscuro, C.verdeTexto, C.verdeFondo, "#cfd8d2", C.verdeCaja, "visto");
+
+  // eje 2
+  bloqueNumerado(L, 30, y2, 770, 288, 2, C.azulMedio, C.azul, C.azulFondo, FOTOS.folder, 290, texto("l4.eje2.etiqueta"));
+  L.rotulo(180, y2 + 52, "l4.eje2.rotulo", { tam: 29, peso: 700, color: C.azul, ancho: 356, inter: 1.2 });
+  L.cifra(338, y2 + 236, "eje2.total", { tam: 106, peso: 700, color: C.azul, ancla: "middle", encoger: 330 });
+  L.rotulo(338, y2 + 274, "l4.unidad", { tam: 34, peso: 700, color: C.azul, ancla: "middle", encoger: 330 });
+  L.rotulo(640, y2 + 152, "l4.eje2.sello", { tam: 28, peso: 700, color: C.azul, ancla: "middle", encoger: 176 });
+  avanceEje(L, y2, "eje2", 2, C.azulIcono, C.azulIcono, C.azulFondo, "#d3d8e0", "#d3e4f7", "calendario");
+
+  // eje 3
+  bloqueNumerado(L, 30, y3, 770, 288, 3, C.lila, C.lilaOscuro, FOTOS.mazo.fondo, FOTOS.mazo, 250, texto("l4.eje3.etiqueta"));
+  L.rotulo(180, y3 + 60, "l4.eje3.rotulo", { tam: 32, peso: 700, color: C.azul, ancho: 350, inter: 1.2 });
+  L.cifra(350, y3 + 214, "poi.cerrados", { tam: 116, peso: 700, color: C.azul, ancla: "middle", encoger: 330 });
+  L.rotulo(350, y3 + 262, "l4.eje3.cerrados", { tam: 34, peso: 700, color: C.azul, ancla: "middle", encoger: 380 });
+  L.panel(814, y3, 1076, 288, C.verdeFondo);
+  L.icono("monedas", 912, y3 + 144, 80, C.verde);
+  L.cifra(1146, y3 + 136, "multas.millones", { tam: 124, peso: 700, color: C.verde, ancla: "middle", encoger: 250 });
+  L.rotulo(1146, y3 + 196, "l4.eje3.multas", { tam: 50, peso: 700, color: C.verdeTexto, ancla: "middle", ancho: 270, inter: 1.04 });
+  L.linea(1308, y3 + 36, 1308, y3 + 252, C.verdeOscuro, 2);
+  L.icono("docVisto", 1430, y3 + 144, 84, null, C.azul);
+  L.rotulo(1556, y3 + 144, "l4.eje3.productos", { tam: 60, peso: 700, color: C.azul, ancho: 330, inter: 1.14, centroY: true });
+  return L;
+}
+
+const DIBUJANTES = [lamina1, lamina2, lamina3, lamina4];
+
+// ------------------------------------------------------------- pantalla
+function dibujar() {
+  D.faltan = new Set();
+  LAMINAS = DIBUJANTES.map((f) => f());
+  $("#laminas").innerHTML = LAMINAS.map((L) => `<section class="lamina">${L.svg()}</section>`).join("");
+  const avisos = [];
+  const fin = D.datos["periodo.fin"] ? String(D.datos["periodo.fin"].valor) : "";
+  const iso = (f) => String(f).split(".").reverse().join("-");
+  const viejas = {};
+  Object.values(D.datos).forEach((d) => { if (d.fecha && fin && iso(d.fecha) < fin) viejas[`${String(d.fuente).split(":")[0]} (datos al ${d.fecha})`] = true; });
+  Object.keys(viejas).forEach((v) => avisos.push(`Fuente anterior al corte: ${v}.`));
+  const ajustados = Object.keys(D.datos).filter((k) => D.datos[k].ajustado);
+  if (ajustados.length) avisos.push(`Con ajuste manual: ${ajustados.join(", ")}.`);
+  if (D.faltan.size) avisos.push(`Faltan en el Excel: ${[...D.faltan].join(", ")}. En la lámina salen entre signos de interrogación.`);
+  $("#avisos").innerHTML = avisos.length ? `<ul>${avisos.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>` : "";
+  const corte = D.datos.corte ? D.datos.corte.valor : "";
+  $("#estado").textContent = `${D.nombre}${corte ? " · corte " + corte : ""} · ${LAMINAS.length} lámina(s)`;
+  ["#btnPdf", "#btnPptx", "#btnPng"].forEach((b) => { $(b).disabled = false; });
+}
+
+async function cargarBuffer(buffer, nombre) {
+  try {
+    D = armarModelo(await leerExcel(buffer), nombre);
+    dibujar();
+  } catch (e) {
+    $("#estado").textContent = "No se pudo leer el archivo: " + e.message;
+    console.error(e);
+  }
+}
+const cargarArchivo = (f) => f && f.arrayBuffer().then((b) => cargarBuffer(b, f.name));
+
+// ------------------------------------------------------------- exportacion
+function pngDeSvg(svg, escala = 2) {
+  return new Promise((ok, mal) => {
+    const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }));
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement("canvas");
+      c.width = ANCHO * escala; c.height = ALTO * escala;
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      ok(c.toDataURL("image/png"));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); mal(new Error("No se pudo convertir la lámina a imagen.")); };
+    img.src = url;
+  });
+}
+const nombreSalida = () => "Presentacion " + (D.datos.corte ? D.datos.corte.valor : "sin corte");
+
+function descargar(url, nombre) {
+  const a = document.createElement("a");
+  a.href = url; a.download = nombre;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+async function exportarPng() {
+  for (let i = 0; i < LAMINAS.length; i++) descargar(await pngDeSvg(LAMINAS[i].svg()), `${nombreSalida()} lamina ${i + 1}.png`);
+}
+
+// Medidas de Segoe UI en PowerPoint, en veces el tamaño: de la linea base al borde superior del cuadro
+// de texto (medido el 12/11/2026 comparando el pptx con la pagina) y alto de la caja de linea.
+const SUBE = 0.948, CAJA = 1.33;
+const PX = 144;   // pixeles del lienzo por pulgada de la diapositiva (1920 / 13.333)
+
+// "#fff" -> "FFFFFF": el pptx solo entiende colores de seis digitos (con tres, PowerPoint pinta negro).
+const hex6 = (c) => { const h = c.replace("#", ""); return (h.length === 3 ? h.replace(/./g, "$&$&") : h).toUpperCase(); };
+
+// Arma el pptx. Cada lamina: la imagen sin los campos como fondo y cada campo como cuadro de texto.
+async function armarPptx() {
+  const p = new PptxGenJS();
+  p.defineLayout({ name: "LAMINA", width: ANCHO / PX, height: ALTO / PX });
+  p.layout = "LAMINA";
+  for (const L of LAMINAS) {
+    const s = p.addSlide();
+    s.addImage({ data: await pngDeSvg(L.svg(false)), x: 0, y: 0, w: ANCHO / PX, h: ALTO / PX });
+    for (const c of L.campos) {
+      const comun = { fontFace: c.peso === 600 ? "Segoe UI Semibold" : "Segoe UI", fontSize: c.tam / 2, bold: c.peso >= 700,
+                      color: hex6(c.color), margin: 0, valign: "top",
+                      align: c.ancla === "middle" ? "center" : c.ancla === "end" ? "right" : "left" };
+      const tramosDe = (l, salto) => l.map((tr, i) => ({ text: tr.t, options: { bold: c.peso >= 700 || tr.b, breakLine: salto && i === l.length - 1 } }));
+      if (c.parrafo) {
+        // un solo cuadro que envuelve, para escribir o corregir un parrafo entero
+        const lineas = c.lineas.filter((l) => l.length);
+        s.addText(lineas.length ? lineas.flatMap((l, i) => tramosDe(l, i < lineas.length - 1)) : " ",
+          { ...comun, x: c.x / PX, y: (c.y - SUBE * c.tam) / PX, w: (c.ancho || 400) / PX, h: (c.alto || 4 * c.paso) / PX,
+            wrap: true, lineSpacingMultiple: c.paso / (CAJA * c.tam) });
+        continue;
+      }
+      c.lineas.forEach((l, i) => {
+        if (!l.length) return;
+        // un cuadro por linea, sin ajuste de linea, con holgura a los lados
+        const w = c.anchos[i] + c.tam * 1.2;
+        const x = c.ancla === "middle" ? c.x - w / 2 : c.ancla === "end" ? c.x - w : c.x;
+        s.addText(tramosDe(l, false), { ...comun, x: x / PX, y: (c.y + i * c.paso - SUBE * c.tam) / PX, w: w / PX, h: CAJA * c.tam / PX, wrap: false });
+      });
+    }
+  }
+  return p;
+}
+async function exportarPptx() {
+  const b = $("#btnPptx");
+  b.disabled = true;
+  try { await (await armarPptx()).writeFile({ fileName: nombreSalida() + ".pptx" }); }
+  catch (e) { $("#estado").textContent = "No se pudo crear el PowerPoint: " + e.message; console.error(e); }
+  b.disabled = false;
+}
+
+// ------------------------------------------------------------- eventos
+$("#btnCargar").onclick = () => $("#archivo").click();
+$("#archivo").onchange = (e) => { cargarArchivo(e.target.files[0]); e.target.value = ""; };
+$("#btnPdf").onclick = () => { document.title = nombreSalida(); window.print(); };
+$("#btnPptx").onclick = exportarPptx;
+$("#btnPng").onclick = exportarPng;
+addEventListener("dragover", (e) => { e.preventDefault(); document.body.classList.add("soltar"); });
+addEventListener("dragleave", () => document.body.classList.remove("soltar"));
+addEventListener("drop", (e) => { e.preventDefault(); document.body.classList.remove("soltar"); cargarArchivo(e.dataTransfer.files[0]); });
+</script>
+</body>
+</html>
